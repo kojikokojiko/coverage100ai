@@ -8,17 +8,7 @@
 
 ## 実行手順
 
-### Step 1: 対象ファイルの確認
-
-`$ARGUMENTS` を Read ツールで読み込み、以下を取得する:
-- パッケージ名 (`package com.example.xxx;`)
-- クラス名
-
-対応するテストファイルのパスを算出する:
-- `src/main/java/com/example/MyService.java`
-  → `src/test/java/com/example/MyServiceTest.java`
-
-### Step 2: 最新のJacocoレポートを生成
+### Step 1: 最新のJacocoレポートを生成
 
 ```bash
 mvn test jacoco:report -q 2>&1
@@ -26,15 +16,63 @@ mvn test jacoco:report -q 2>&1
 
 失敗した場合はエラー内容を確認し、コンパイルエラーや依存関係の問題を先に修正する。
 
-### Step 3: カバレッジ不足ブランチの特定
+### Step 2: 対象クラスの未カバーブランチだけを抽出
 
-`target/site/jacoco/jacoco.xml` を Read ツールで読み込む。
+以下のスクリプトを実行して、対象クラスの未カバー情報のみを取得する。
+**jacoco.xml 全体を Read ツールで読み込んではいけない**（プロジェクトが大きいと巨大になるため）。
 
-対象クラスの `<sourcefile name="クラス名.java">` セクションを探し、以下を確認する:
-- `<counter type="BRANCH" missed="N" covered="M"/>` で `missed > 0` なら未カバーブランチあり
-- `<line nr="行番号" ... mb="N" cb="M"/>` で `mb > 0` の行 = 未カバーブランチのある行
+```bash
+python3 - << 'PYEOF'
+import xml.etree.ElementTree as ET, sys, os, json
 
-特定した行番号をソースコードと照合し、**どの条件分岐が未テストか**を分析する。
+target_path = "$ARGUMENTS"
+class_name = os.path.basename(target_path)  # e.g. DiscountService.java
+
+xml_path = "target/site/jacoco/jacoco.xml"
+if not os.path.exists(xml_path):
+    print(json.dumps({"error": "jacoco.xml not found. Run mvn test jacoco:report first."}))
+    sys.exit(1)
+
+tree = ET.parse(xml_path)
+root = tree.getroot()
+
+result = {"class": class_name, "uncovered_lines": [], "branch_summary": {}}
+
+for sf in root.findall(f'.//sourcefile[@name="{class_name}"]'):
+    for line in sf.findall("line"):
+        mb = int(line.get("mb", 0))
+        cb = int(line.get("cb", 0))
+        if mb > 0:
+            result["uncovered_lines"].append({
+                "line": int(line.get("nr")),
+                "missed_branches": mb,
+                "covered_branches": cb
+            })
+    for counter in sf.findall("counter[@type='BRANCH']"):
+        missed = int(counter.get("missed", 0))
+        covered = int(counter.get("covered", 0))
+        total = missed + covered
+        result["branch_summary"] = {
+            "missed": missed,
+            "covered": covered,
+            "total": total,
+            "pct": round(covered / total * 100, 1) if total > 0 else 100.0
+        }
+
+print(json.dumps(result, indent=2))
+PYEOF
+```
+
+このスクリプトの出力JSON だけを見て未カバーブランチを把握する。
+
+`branch_summary.missed == 0` なら **100%達成済み**。完了を報告して終了する。
+
+### Step 3: ソースファイルを読み込む
+
+`$ARGUMENTS` を Read ツールで読み込む。
+Step 2 の `uncovered_lines` の行番号に注目し、**どの条件分岐が未テストか**を分析する。
+
+パッケージ名とクラス名も取得しておく。
 
 典型的なパターン:
 - `if (x == null)` → null ケースが未テスト
@@ -44,6 +82,10 @@ mvn test jacoco:report -q 2>&1
 - `&&` / `||` の短絡評価 → 片方の分岐が未テスト
 
 ### Step 4: テストファイルの確認・作成
+
+対応するテストファイルのパスを算出する:
+- `src/main/java/com/example/MyService.java`
+  → `src/test/java/com/example/MyServiceTest.java`
 
 テストファイルが存在する場合: Read ツールで読み込み、既存テストの構造・使用しているモックを把握する。
 
@@ -66,14 +108,12 @@ class [クラス名]Test {
 
     @InjectMocks
     private [クラス名] target;
-
-    // モックは必要に応じて追加
 }
 ```
 
 ### Step 5: テストコードの生成・追加
 
-Step 3 で特定した未カバーブランチをすべてカバーするテストメソッドを生成し、テストファイルに追加する。
+Step 2 で特定した未カバーブランチをすべてカバーするテストメソッドを生成し、テストファイルに追加する。
 
 テスト生成の方針:
 - 1つのブランチ = 1つの `@Test` メソッド（名前は `test_[メソッド名]_[シナリオ]` 形式）
@@ -93,18 +133,18 @@ mvn test jacoco:report -q 2>&1
 2. テストコードを修正
 3. 再度実行
 
-### Step 7: カバレッジ検証・ループ
+### Step 7: 結果確認・ループ
 
-`target/site/jacoco/jacoco.xml` を再度読み込み、対象クラスの `<counter type="BRANCH" missed="N"/>` を確認する。
+Step 2 のスクリプトを再実行して結果を確認する（jacoco.xml 全体は読まない）。
 
-- `missed="0"` → **完了！** ブランチカバレッジ100%達成を報告する
-- `missed > 0` → まだ未カバーブランチが残っている → Step 3 に戻る
+- `missed == 0` → **完了！** ブランチカバレッジ100%達成を報告する
+- `missed > 0` → まだ未カバーブランチが残っている → Step 3 に戻る（最大5回）
 
 ---
 
 ## 注意事項
 
-- `enum` の暗黙的なブランチや到達不能コードは、`// coverage:ignore` コメントや JaCoCo の除外設定を提案する
-- 外部ライブラリのコードは対象外
+- **jacoco.xml 全体を Read ツールで読み込んではいけない**。必ず Step 2 のスクリプト経由で取得する
+- `enum` の暗黙的なブランチや到達不能コードは JaCoCo の除外設定を提案する
 - テストの品質より**カバレッジ達成を優先**する（クソ縛りなので）
 - ループは最大5回まで。5回で達成できない場合は残りの未カバーブランチと理由を報告する
